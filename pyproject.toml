@@ -1,0 +1,32 @@
+[build-system]
+requires = ["hatchling>=1.27,<2"]
+build-backend = "hatchling.build"
+
+[project]
+name = "personal-coding-agent"
+version = "0.1.0"
+description = "用于个人编码和学习展示的 Ark CLI 编程助手"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+  "volcengine-python-sdk[ark]==5.0.53",
+  "prompt-toolkit==3.0.53",
+  "rich==15.0.0",
+  "pydantic==2.14.1",
+]
+
+[project.scripts]
+cagent = "coding_agent.cli:main"
+
+[dependency-groups]
+dev = ["pytest>=8,<10", "pytest-asyncio>=0.24,<2", "pytest-json-report>=1.5,<2"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/coding_agent"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+
+[tool.uv]
+package = true
