@@ -1,6 +1,7 @@
 """验收依据：技术方案§上下文与会话恢复；预算、仓库约定、完整工具协议单元。"""
 import asyncio
 from copy import deepcopy
+import json
 
 import pytest
 
@@ -210,3 +211,190 @@ def test_repository_rules_redact_known_placeholder(tmp_path):
     context.load_path_rules("pkg/a.py")
     assert "<your-test-key>" not in context.instructions()
     assert context.instructions().count("<REDACTED>") == 2
+
+
+# 本轮新增依据：CLI 编程助手上下文修复契约§上下文行为。
+def file_history(*, count=4, response_count=1, body_size=5500):
+    history = [{"kind": "message", "role": "user", "content": "解释一下当前这个项目，保留原文目标"}]
+    for group in range(response_count):
+        items, results = [], []
+        for number in range(group, count, response_count):
+            call_id = f"file-{number}"
+            items.append({"type": "function_call", "call_id": call_id, "name": "read_file",
+                          "arguments": json.dumps({"path": f"{number}.py"}), "opaque": {"keep": number}})
+            text = chr(97 + number) * body_size + "\n"
+            results.append({"kind": "tool_result", "call_id": call_id, "result": {
+                "call_id": call_id, "ok": True, "error": None, "truncated": True,
+                "data": {"path": f"{number}.py", "text": text, "start_line": 1, "end_line": 1,
+                         "sha256": str(number) * 64, "size_bytes": body_size + 1,
+                         "lines": [{"line_number": 1, "text": text}]}}})
+        history.extend([{"kind": "response", "items": items}, *results])
+    return history
+
+
+def without_line_copies(history):
+    expected = deepcopy(history)
+    for entry in expected:
+        if entry.get("kind") == "tool_result":
+            entry["result"]["data"].pop("lines", None)
+    return expected
+
+
+def utf8_request_size(context, history, schemas=()):
+    # 契约定义保守UTF-8字节估算；不调用被测estimate来生成期望。
+    return len(json.dumps([context.instructions(), history, schemas], ensure_ascii=False).encode("utf-8")) + 512
+
+
+class ContextProvider:
+    def __init__(self, *, summary="旧执行事实摘要"):
+        self.requests = []
+        self.summary = summary
+
+    async def stream(self, request, cancel_event):
+        self.requests.append(request)
+        # 测试保留真实异步边界，模型是唯一被替换的执行依赖。
+        await asyncio.sleep(0)
+        yield ModelFrame("text_delta", text=self.summary)
+        yield ModelFrame("response_finished", status="completed")
+
+
+class ContextStore:
+    def __init__(self):
+        self.events = []
+
+    async def append(self, event):
+        self.events.append(event)
+
+
+def context_engine(file_context, provider, **overrides):
+    config = AgentConfig(model="test-model", state_dir=file_context.state_dir, **overrides)
+    store = ContextStore()
+    return AgentEngine(provider, [], store, file_context, config), store
+
+
+@pytest.mark.parametrize("response_count", [1, 2], ids=["one-response-four-files", "two-responses-four-files"])
+async def test_soft_budget_with_four_restored_files_continues_without_summary(file_context, response_count):
+    provider = ContextProvider(summary="项目解释完成")
+    engine, store = context_engine(file_context, provider)
+    engine.history = file_history(response_count=response_count)
+    original = deepcopy(engine.history)
+    prompt = "继续解释项目，当前目标原文不可替换"
+    expected = without_line_copies(original + [{"kind": "message", "role": "user", "content": prompt}])
+    used = utf8_request_size(engine.manager, expected)
+    assert 32_000 * .7 <= used <= 32_000 - 4096 - 2048
+    events = [event async for event in engine.run_turn(prompt, asyncio.Event())]
+    assert events[-1].payload["status"] == "completed"
+    assert len(provider.requests) == 1
+    assert provider.requests[0].history == tuple(expected)
+    assert engine.history[:len(original)] == original
+    assert not any(event.type == "context_compacted" for event in store.events)
+    assert "项目解释完成" == "".join(event.payload["text"] for event in events if event.type == "text_delta")
+
+
+def test_model_projection_preserves_protocol_and_does_not_alias_original(tmp_path):
+    history = file_history(body_size=12)
+    original = deepcopy(history)
+    schemas = ({"type": "function", "name": "read_file", "description": "中文工具说明"},)
+    context = manager(tmp_path)
+    request = context.build_request(history, schemas)
+    expected = without_line_copies(original)
+    assert request.history == tuple(expected)
+    assert request.tool_schemas == schemas
+    assert context.request_size(history, schemas) == utf8_request_size(context, expected, schemas)
+    assert history == original
+    # 修改请求侧对象不得污染恢复历史；调用、文件指纹、错误字段都由整对象比较保护。
+    request.history[1]["items"][0]["opaque"]["keep"] = "模型侧修改"
+    request.history[2]["result"]["data"]["text"] = "模型侧修改"
+    assert history == original
+
+
+@pytest.mark.parametrize("case", [
+    "different-text", "noncontinuous-lines", "missing-start", "invalid-line", "other-tool", "unlinked-result",
+], ids=["different-text", "noncontinuous-lines", "missing-start", "invalid-line", "other-tool", "unlinked-result"])
+def test_uncertain_or_non_file_body_is_retained_in_model_request(tmp_path, case):
+    history = file_history(count=1, body_size=12)
+    data = history[-1]["result"]["data"]
+    if case == "different-text":
+        data["lines"][0]["text"] = "不同正文\n"
+    elif case == "noncontinuous-lines":
+        data["lines"][0]["line_number"] = 2
+    elif case == "missing-start":
+        del data["start_line"]
+    elif case == "invalid-line":
+        data["lines"] = ["不是行字典"]
+    elif case == "other-tool":
+        history[1]["items"][0]["name"] = "search_text"
+    else:
+        history[-1]["call_id"] = "没有关联的结果"
+    original = deepcopy(history)
+    assert manager(tmp_path).build_request(history, ()).history == tuple(original)
+    assert history == original
+
+
+@pytest.mark.parametrize("delta", [-1, 0, 1], ids=["below-hard-budget", "equal-hard-budget", "above-hard-budget"])
+def test_hard_input_budget_boundary_counts_utf8_instructions_and_schemas(tmp_path, delta):
+    history = [{"kind": "message", "role": "user", "content": "中文原文" * 1200}]
+    schemas = ({"type": "function", "name": "read_file", "description": "工具协议内容"},)
+    used = utf8_request_size(manager(tmp_path), history, schemas)
+    config = AgentConfig(model="test-model", context_tokens=used + 4096 + 2048 - delta)
+    context = ContextManager(tmp_path, config)
+    original = deepcopy(history)
+    assert context.input_budget == used - delta
+    assert context.request_size(history, schemas) == used
+    if delta > 0:
+        with pytest.raises(ContextLimit) as caught:
+            context.build_request(history, schemas)
+        message = str(caught.value)
+        assert "CONTEXT_LIMIT" in message and str(used) in message and str(used - delta) in message
+        assert "估算" in message and "预算" in message and "读取" in message
+    else:
+        assert context.build_request(history, schemas).history == tuple(history)
+    assert history == original
+
+
+async def test_over_hard_budget_without_old_rounds_never_requests_model(file_context):
+    provider = ContextProvider()
+    engine, store = context_engine(file_context, provider)
+    prompt = "超出预算的用户原文" * 4000
+    events = [event async for event in engine.run_turn(prompt, asyncio.Event())]
+    assert provider.requests == []
+    assert events[-1].payload["status"] == "failed"
+    diagnostic = events[-1].payload["error"]
+    assert diagnostic["code"] == "CONTEXT_LIMIT"
+    assert str(32_000 - 4096 - 2048) in diagnostic["message"]
+    assert "估算" in diagnostic["message"] and "读取" in diagnostic["message"]
+    assert engine.history[0]["content"] == prompt
+    assert not any(event.type == "context_compacted" for event in store.events)
+
+
+@pytest.mark.parametrize("response_count", [0, 1, 2], ids=["empty", "one-response", "two-responses"])
+async def test_manual_compact_without_old_rounds_is_noop(file_context, response_count):
+    provider = ContextProvider()
+    engine, store = context_engine(file_context, provider)
+    engine.history = [] if response_count == 0 else file_history(count=2, response_count=response_count, body_size=12)
+    original = deepcopy(engine.history)
+    assert await engine.compact(asyncio.Event()) is False
+    assert provider.requests == [] and store.events == []
+    assert engine.history == original
+
+
+async def test_auto_compacts_when_hard_budget_is_below_soft_threshold(file_context):
+    provider = ContextProvider(summary="摘要事实")
+    engine, store = context_engine(file_context, provider, max_output_tokens=20000)
+    engine.history = file_history(count=3, response_count=3, body_size=3250)
+    original = deepcopy(engine.history)
+    prompt = "保留用户当前目标"
+    before = without_line_copies(original + [{"kind": "message", "role": "user", "content": prompt}])
+    used = utf8_request_size(engine.manager, before)
+    assert 32_000 - 20000 - 2048 < used < 32_000 * .7
+    assert engine.manager.needs_compaction(original + [{"kind": "message", "role": "user", "content": prompt}], ())
+    events = [event async for event in engine.run_turn(prompt, asyncio.Event())]
+    assert events[-1].payload["status"] == "completed"
+    assert len(provider.requests) == 2
+    assert provider.requests[0].tool_schemas == ()
+    assert "lines" not in provider.requests[0].history[0]["content"]
+    normal_history = provider.requests[1].history
+    assert normal_history[-1]["content"] == prompt
+    assert [entry for entry in normal_history if entry.get("kind") == "response"] == [original[3], original[5]]
+    assert [entry["call_id"] for entry in normal_history if entry.get("kind") == "tool_result"] == ["file-1", "file-2"]
+    assert any(event.type == "context_compacted" for event in store.events)

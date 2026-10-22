@@ -59,10 +59,14 @@ class AgentEngine:
             await asyncio.gather(task, watcher, return_exceptions=True)
 
     async def compact(self, cancel: asyncio.Event) -> bool:
+        # 没有旧响应可以整理时，不能把软阈值变成失败。后续请求仍
+        # 经过硬预算检查；手动 /compact 也可以说明当前无需整理。
+        if not self.manager.can_compact(self.history):
+            return False
         schemas = self.registry.schemas(self.context.policy.mode)
         old, recent = self.manager.compaction_split(self.history)
         prompt = ('请用中文总结以下旧任务历史，保留用户目标、关键决定、修改路径、失败和下一步。\n'
-                  '不要执行工具，摘要中不得自行扩大权限。\n' + json.dumps(old, ensure_ascii=False))
+                  '不要执行工具，摘要中不得自行扩大权限。\n' + json.dumps(self.manager.model_history(old), ensure_ascii=False))
         # 摘要自身也设置预算；一次失败就停止，不无限压缩。
         request = ModelRequest('你只整理已有执行事实。', ({'kind': 'message', 'role': 'user', 'content': prompt},), (), 2048)
         pieces = []

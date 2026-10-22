@@ -81,15 +81,17 @@ async def interactive(engine, config, console=None):
             elif prompt == '/diff':
                 console.print(Syntax(engine.context.snapshots.diff() or '没有 Agent 文件修改', 'diff'))
             elif prompt == '/context':
-                console.print(f'保守估算：{engine.manager.estimate(engine.history)} / {config.context_tokens}')
+                schemas = engine.registry.schemas(engine.context.policy.mode)
+                console.print(f'请求保守估算：{engine.manager.request_size(engine.history, schemas)} / '
+                              f'可用输入预算 {engine.manager.input_budget}')
             elif prompt == '/compact':
                 cancel = asyncio.Event()
                 loop = asyncio.get_running_loop()
                 previous = signal.getsignal(signal.SIGINT)
                 loop.add_signal_handler(signal.SIGINT, cancel.set)
                 try:
-                    await engine.compact(cancel)
-                    console.print('历史已整理，完整日志保留。')
+                    changed = await engine.compact(cancel)
+                    console.print('历史已整理，完整日志保留。' if changed else '当前没有可整理的旧轮次，无需整理。')
                 except asyncio.CancelledError:
                     console.print('历史整理已取消，保留原历史。')
                 except Exception as exc:

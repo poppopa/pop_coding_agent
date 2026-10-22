@@ -1,5 +1,6 @@
 """上下文是有限资源；压缩必须保留完整的工具调用及结果单元。"""
 from __future__ import annotations
+from copy import deepcopy
 from pathlib import Path
 import json
 from coding_agent.config import AgentConfig
@@ -56,15 +57,57 @@ class ContextManager:
         # UTF-8 字节作为保守预算估算；实际服务端用量由 usage 反馈。
         return len(json.dumps(value, ensure_ascii=False).encode('utf-8')) + 512
 
+    @property
+    def input_budget(self) -> int:
+        return self.config.context_tokens - self.config.max_output_tokens - 2048
+
+    @staticmethod
+    def model_history(history: list[dict]) -> list[dict]:
+        """只精简模型请求的重复正文，不改变持久化日志或恢复历史。
+
+        旧版本 read_file 同时保存 text 与逐行副本。只有关联到真实
+        read_file 调用、逐行副本完整相同且行号连续时才省去副本；
+        非文件结果和供应商原始输出保持原样，call_id 也不重建。
+        """
+        projected = deepcopy(history)
+        names = {}
+        for entry in projected:
+            if entry.get('kind') == 'response':
+                for item in entry.get('items', ()):
+                    if item.get('type') == 'function_call':
+                        names[item.get('call_id')] = item.get('name')
+            elif entry.get('kind') == 'tool_result' and names.get(entry.get('call_id')) == 'read_file':
+                data = entry.get('result', {}).get('data', {})
+                text, lines = data.get('text'), data.get('lines')
+                start = data.get('start_line')
+                if not isinstance(text, str) or not isinstance(lines, list) or not isinstance(start, int):
+                    continue
+                if all(isinstance(line, dict) and isinstance(line.get('text'), str)
+                       and line.get('line_number') == start + i for i, line in enumerate(lines)):
+                    if ''.join(line['text'] for line in lines) == text:
+                        del data['lines']
+        return projected
+
+    def request_size(self, history: list[dict], schemas: tuple[dict, ...]) -> int:
+        return self.estimate([self.instructions(), self.model_history(history), schemas])
+
+    @staticmethod
+    def can_compact(history: list[dict]) -> bool:
+        return sum(item.get('kind') == 'response' for item in history) > 2
+
     def build_request(self, history: list[dict], schemas: tuple[dict, ...]) -> ModelRequest:
         instructions = self.instructions()
-        budget = self.config.context_tokens - self.config.max_output_tokens - 2048
-        if self.estimate([instructions, history, schemas]) > budget:
-            raise ContextLimit('CONTEXT_LIMIT: 当前完整轮次过大，请缩小任务或文件范围')
-        return ModelRequest(instructions, tuple(history), schemas, self.config.max_output_tokens)
+        projected = self.model_history(history)
+        used = self.estimate([instructions, projected, schemas])
+        if used > self.input_budget:
+            raise ContextLimit(f'CONTEXT_LIMIT: 请求保守估算 {used}，可用输入预算 {self.input_budget}；'
+                               '当前保留轮次过大，请缩小文件读取范围或分段读取')
+        return ModelRequest(instructions, tuple(projected), schemas, self.config.max_output_tokens)
 
     def needs_compaction(self, history: list[dict], schemas: tuple[dict, ...]) -> bool:
-        return self.estimate([self.instructions(), history, schemas]) >= self.config.context_tokens * .7
+        used = self.request_size(history, schemas)
+        # 软阈值只用于提前整理；输出预算较大时硬上限可能更早到达。
+        return used >= self.config.context_tokens * .7 or used > self.input_budget
 
     def compaction_split(self, history: list[dict]) -> tuple[list[dict], list[dict]]:
         # 以完整 response 单元分界；它后面的 tool_result 全部保留。

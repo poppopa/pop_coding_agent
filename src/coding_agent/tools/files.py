@@ -20,7 +20,9 @@ from coding_agent.tools.paths import (
 class ReadFileInput(ToolInput):
     path: str = Field(min_length=1)
     start_line: int = Field(default=1, ge=1)
+    start_column: int = Field(default=0, ge=0)
     max_lines: int = Field(default=200, ge=1, le=400)
+    max_bytes: int = Field(default=4096, ge=256, le=8192)
 
 
 class FindFilesInput(ToolInput):
@@ -125,7 +127,8 @@ async def _candidates(context: ToolContext, pattern: str,
 
 class ReadFileTool(Tool):
     name = 'read_file'
-    description = '读取仓库内 UTF-8 文件的指定行，返回完整文件 SHA-256；文件最大 1 MiB'
+    description = ('分页读取仓库内 UTF-8 文件，默认最多200行/4096字节；文件最大1 MiB。'
+                   '返回完整SHA-256和next_start_line/next_start_column，续读时使用这两个位置；列按脱敏后字符从0计数')
     input_type = ReadFileInput
 
     async def execute(self, arguments: dict, context: ToolContext,
@@ -136,21 +139,54 @@ class ReadFileTool(Tool):
                 raise FileToolError('TOOL_CANCELLED', '文件读取已取消')
             path = checked_path(context, args.path)
             content, _ = read_bytes(path)
-            text = decode_text(content)
+            # 先对完整正文脱敏，再分页。若先切页再脱敏，跨页凭证的
+            # 两段都可能无法匹配；游标必须指向稳定的脱敏后正文。
+            text = context.redactor.text(decode_text(content))
             # 指纹来自完整原始字节，不能用行范围或脱敏文本计算，否则
             # expected_sha256 无法保护文件的未显示部分。splitlines 保留
             # 原换行符，CRLF 文件也不经过隐式换行转换。
             lines = text.splitlines(keepends=True)
             start = args.start_line - 1
-            selected = lines[start:start + args.max_lines]
-            truncated = start > 0 or start + len(selected) < len(lines)
+            column = args.start_column
+            if (start >= len(lines) and column) or (start < len(lines) and column > len(lines[start])):
+                raise FileToolError('INVALID_ARGUMENTS', 'start_column 超出所指定行的脱敏后文本长度')
+            if start < len(lines) and column == len(lines[start]):
+                start, column = start + 1, 0
+            page_start, page_column = start, column
+            selected = []
+            remaining = args.max_bytes
+            while start < len(lines) and len(selected) < args.max_lines:
+                line = lines[start][column:]
+                encoded = line.encode('utf-8')
+                # decode(ignore) 只舍弃截在末尾的不完整UTF-8字符，
+                # 游标按真正发出的字符推进，下一页会完整补上它。
+                part = encoded[:remaining].decode('utf-8', errors='ignore')
+                # 后续日志边界还会再次脱敏，不能把替换标记截成两半。
+                # 完整标记才能保持重复脱敏幂等，续读游标也不会漂移。
+                marker = '<REDACTED>'
+                marker_start = line.rfind(marker, 0, len(part) + len(marker))
+                if marker_start >= 0 and marker_start < len(part) < marker_start + len(marker):
+                    part = line[:marker_start]
+                if not part:
+                    break
+                selected.append({'line_number': start + 1, 'text': part})
+                remaining -= len(part.encode('utf-8'))
+                if len(part) < len(line):
+                    column += len(part)
+                    break
+                start, column = start + 1, 0
+                if remaining == 0:
+                    break
+            has_next = start < len(lines)
+            truncated = page_start > 0 or page_column > 0 or has_next
             data = {
                 'path': path.relative_to(Path(context.root).resolve()).as_posix(),
-                'start_line': args.start_line,
-                'end_line': args.start_line + len(selected) - 1 if selected else None,
-                'total_lines': len(lines), 'text': ''.join(selected),
-                'lines': [{'line_number': args.start_line + i, 'text': line}
-                          for i, line in enumerate(selected)],
+                'start_line': page_start + 1, 'start_column': page_column,
+                'end_line': selected[-1]['line_number'] if selected else None,
+                'total_lines': len(lines), 'text': ''.join(line['text'] for line in selected),
+                'lines': selected,
+                'next_start_line': start + 1 if has_next else None,
+                'next_start_column': column if has_next else None,
                 'sha256': sha256(content), 'size_bytes': len(content), 'truncated': truncated,
             }
             return ToolResult(context.call_id, True, context.redactor.value(data), truncated=truncated)

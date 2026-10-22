@@ -8,7 +8,9 @@ import pytest
 from prompt_toolkit.keys import Keys
 from rich.console import Console
 
-from coding_agent.domain import Event
+from coding_agent.domain import Event, ModelFrame
+from coding_agent.config import AgentConfig
+from coding_agent.engine import AgentEngine
 from coding_agent.policy import Policy
 from coding_agent.security import Redactor
 from coding_agent.ui import terminal
@@ -95,3 +97,83 @@ def test_summary_shows_unverified_change_and_true_pass_count():
     output.truncate()
     renderer.handle(Event(1, "s", "t", 2, "turn_finished", {"status": "completed", "changes": [], "verifications": [{"exit_code": 0, "passed": True, "cancelled": False, "timed_out": False}, {"exit_code": 1, "passed": False, "cancelled": False, "timed_out": False}]}))
     assert "1/2 条命令通过" in output.getvalue()
+
+
+async def test_context_and_noop_compact_show_input_budget_without_model_request(file_context, tmp_path, monkeypatch):
+    # 修复契约§上下文行为：终端显示真实输入预算并区分无需整理。
+    prompts = iter(["/context", "/compact", "/exit"])
+
+    class Prompt:
+        def __init__(self, **kwargs):
+            pass
+
+        async def prompt_async(self, text):
+            return next(prompts)
+
+    class Store:
+        directory = tmp_path
+
+        async def append(self, event):
+            raise AssertionError("本地查看及无需整理不新增事件")
+
+    class Provider:
+        async def stream(self, request, cancel_event):
+            raise AssertionError("无旧轮次时不请求模型")
+            yield
+
+    config = AgentConfig(model="test-model", state_dir=file_context.state_dir)
+    engine = AgentEngine(Provider(), [], Store(), file_context, config)
+    engine.history = [{"kind": "message", "role": "user", "content": "当前目标原文"}]
+    monkeypatch.setattr(terminal, "PromptSession", Prompt)
+    monkeypatch.setattr(terminal, "patch_stdout", nullcontext)
+    output = StringIO()
+    assert await terminal.interactive(engine, config, Console(file=output, width=160)) == 0
+    text = output.getvalue()
+    assert "保守估算" in text and "可用输入预算 25856" in text
+    assert str(engine.manager.request_size(engine.history, ())) in text
+    assert "无需整理" in text
+    assert "历史已整理" not in text and "CONTEXT_LIMIT" not in text
+
+
+async def test_successful_manual_compact_reports_completed_and_preserves_current_goal(file_context, tmp_path, monkeypatch):
+    # 修复契约：可整理时保留最后两轮，终端仅在实际成功后显示已整理。
+    prompts = iter(["/compact", "/exit"])
+
+    class Prompt:
+        def __init__(self, **kwargs):
+            pass
+
+        async def prompt_async(self, text):
+            return next(prompts)
+
+    class Store:
+        directory = tmp_path
+
+        def __init__(self):
+            self.events = []
+
+        async def append(self, event):
+            self.events.append(event)
+
+    class Provider:
+        def __init__(self):
+            self.requests = []
+
+        async def stream(self, request, cancel_event):
+            self.requests.append(request)
+            yield ModelFrame("text_delta", text="保留旧事实的摘要")
+            yield ModelFrame("response_finished", status="completed")
+
+    config = AgentConfig(model="test-model", state_dir=file_context.state_dir)
+    provider, store = Provider(), Store()
+    engine = AgentEngine(provider, [], store, file_context, config)
+    goal = {"kind": "message", "role": "user", "content": "当前目标原文"}
+    engine.history = [goal, *[{"kind": "response", "items": []} for _ in range(3)]]
+    monkeypatch.setattr(terminal, "PromptSession", Prompt)
+    monkeypatch.setattr(terminal, "patch_stdout", nullcontext)
+    output = StringIO()
+    assert await terminal.interactive(engine, config, Console(file=output, width=160)) == 0
+    assert "历史已整理" in output.getvalue() and "无需整理" not in output.getvalue()
+    assert len(provider.requests) == 1
+    assert engine.history[1] == goal
+    assert [event.type for event in store.events] == ["context_compacted"]
