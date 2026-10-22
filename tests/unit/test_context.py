@@ -88,7 +88,7 @@ def test_recent_rounds_are_not_discarded_for_compaction(tmp_path, count):
         manager(tmp_path).compaction_split(history)
 
 
-async def test_failed_summary_is_attempted_once_and_history_is_preserved(tmp_path):
+async def test_failed_summary_is_attempted_once_and_original_recent_history_is_preserved(tmp_path):
     class Provider:
         def __init__(self):
             self.requests = []
@@ -113,12 +113,14 @@ async def test_failed_summary_is_attempted_once_and_history_is_preserved(tmp_pat
     engine = AgentEngine(provider, [], store, context, config)
     engine.history = sum([history_round(i) for i in range(4)], [])
     original = deepcopy(engine.history)
-    with pytest.raises(ContextLimit, match="CONTEXT_LIMIT"):
-        await engine.compact(asyncio.Event())
+    # 摘要恢复契约修订：失败后允许本地事实整理，最近两轮仍保持原文。
+    assert await engine.compact(asyncio.Event()) is True
     assert len(provider.requests) == 1
     assert provider.requests[0].tool_schemas == ()
-    assert engine.history == original
-    assert store.events == []
+    assert engine.history[1:] == original[-6:]
+    assert store.events[0].type == "context_compacted"
+    assert store.events[0].payload["source"] == "local"
+    assert "目标0" in engine.history[0]["content"]
 
 
 def test_path_rules_follow_root_to_child_and_agents_priority(tmp_path):

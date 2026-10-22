@@ -19,6 +19,10 @@ class TerminalRenderer:
         if event.type == 'text_delta':
             self.console.print(p['text'], end='', markup=False, highlight=False)
             self.streaming = True
+        elif event.type == 'state_changed' and p.get('state') == 'context_ready':
+            self._break()
+            self.console.print('模型摘要不可用，已按本地执行事实整理，继续任务。' if p.get('source') == 'local'
+                               else '上下文已整理，继续任务。', markup=False, highlight=False)
         elif event.type == 'tool_started':
             self._break()
             self.console.print(f"[cyan]工具[/cyan] {p['name']}", markup=True)

@@ -52,3 +52,4 @@ class ModelRequest:
     history: tuple[dict[str, Any], ...]
     tool_schemas: tuple[dict[str, Any], ...]
     max_output_tokens: int = 4096
+    retry_on_connection_error: bool = True

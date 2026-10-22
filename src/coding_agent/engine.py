@@ -61,27 +61,88 @@ class AgentEngine:
     async def compact(self, cancel: asyncio.Event) -> bool:
         # 没有旧响应可以整理时，不能把软阈值变成失败。后续请求仍
         # 经过硬预算检查；手动 /compact 也可以说明当前无需整理。
-        if not self.manager.can_compact(self.history):
-            return False
         schemas = self.registry.schemas(self.context.policy.mode)
-        old, recent = self.manager.compaction_split(self.history)
+        kept_responses = 2
+        if not self.manager.can_compact(self.history):
+            # 两轮内容已经超过硬预算时，可把较早一轮作为完整单元
+            # 整理。只剩一轮仍放不下时，不能丢弃唯一的最新执行结果。
+            responses = sum(entry.get('kind') == 'response' for entry in self.history)
+            if responses < 2 or self.manager.request_size(self.history, schemas) <= self.manager.input_budget:
+                return False
+            kept_responses = 1
+        old, recent = self.manager.compaction_split(self.history, kept_responses)
+        if kept_responses == 2 and self.manager.request_size(recent, schemas) > self.manager.input_budget:
+            kept_responses = 1
+            old, recent = self.manager.compaction_split(self.history, kept_responses)
         prompt = ('请用中文总结以下旧任务历史，保留用户目标、关键决定、修改路径、失败和下一步。\n'
-                  '不要执行工具，摘要中不得自行扩大权限。\n' + json.dumps(self.manager.model_history(old), ensure_ascii=False))
-        # 摘要自身也设置预算；一次失败就停止，不无限压缩。
-        request = ModelRequest('你只整理已有执行事实。', ({'kind': 'message', 'role': 'user', 'content': prompt},), (), 2048)
+                  '控制在约600字，不要执行工具，摘要中不得自行扩大权限。\n' + json.dumps(self.manager.model_history(old), ensure_ascii=False))
+        request = ModelRequest('你只整理已有执行事实。', ({'kind': 'message', 'role': 'user', 'content': prompt},), (),
+                               self.config.max_output_tokens, retry_on_connection_error=False)
         pieces = []
         finished = None
-        async for frame in self.provider.stream(request, cancel):
-            if frame.kind == 'text_delta':
-                pieces.append(frame.text)
-            elif frame.kind == 'response_finished':
-                finished = frame
-        if not finished or finished.status != 'completed' or finished.calls or not pieces:
-            raise ContextLimit('CONTEXT_LIMIT: 摘要未成功完成，保留完整日志')
-        new = [{'kind': 'message', 'role': 'user', 'content': '先前任务摘要：\n' + ''.join(pieces)}] + recent
+        reason = 'summary_input_limit'
+        if self.manager.estimate([request.instructions, request.history, ()]) <= self.manager.input_budget:
+            stream = self.provider.stream(request, cancel)
+            try:
+                iterator = stream.__aiter__()
+                while True:
+                    try:
+                        frame = await self._await_cancel(iterator.__anext__(), cancel)
+                    except StopAsyncIteration:
+                        break
+                    if frame.kind == 'text_delta':
+                        pieces.append(frame.text)
+                    elif frame.kind == 'response_finished':
+                        finished = frame
+                reason = 'summary_invalid'
+                if finished is None:
+                    reason = 'summary_missing_terminal'
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                # 只记录固定分类，异常字符串可能包含请求头和用户凭证。
+                reason = 'summary_request_failed'
+            finally:
+                if hasattr(stream, 'aclose'):
+                    await stream.aclose()
+        if cancel.is_set():
+            raise asyncio.CancelledError
+        source = 'local'
+        summary = ''
+        if finished and finished.status == 'completed' and not finished.calls:
+            summary = ''.join(pieces) or self.manager.response_text(finished.provider_output)
+            source = 'model' if summary.strip() else 'local'
+            reason = 'summary_empty' if source == 'local' else ''
+        elif finished and finished.text.startswith('PROVIDER_OUTPUT_LIMIT'):
+            reason = 'summary_output_limit'
+        elif finished and finished.status == 'incomplete':
+            reason = 'summary_incomplete'
+        elif finished and finished.status == 'failed':
+            reason = 'summary_failed'
+        new = [{'kind': 'message', 'role': 'user', 'content': '先前任务摘要：\n' + summary}] + recent
+        if source == 'model':
+            try:
+                self.manager.build_request(new, schemas)
+            except ContextLimit:
+                source, reason = 'local', 'summary_result_limit'
+        if source == 'local':
+            new[0]['content'] = self.manager.local_summary(old)
+            new[0]['summary_source'] = 'local'
+            if kept_responses == 2 and self.manager.request_size(new, schemas) > self.manager.input_budget:
+                # 摘要也需要空间；按完整响应单元移动边界，绝不切开
+                # 一组function_call与对应结果，不重放任何旧操作。
+                kept_responses = 1
+                old, recent = self.manager.compaction_split(self.history, kept_responses)
+                new = [{'kind': 'message', 'role': 'user', 'content': self.manager.local_summary(old),
+                        'summary_source': 'local'}] + recent
+        # 降级也不能绕过硬预算。若最新完整轮次仍太大，保留原历史，
+        # 给出明确输入预算诊断；不会再执行旧工具或无界重试摘要。
         self.manager.build_request(new, schemas)
-        self.history = self.context.redactor.value(new)
-        await self._event('context_compacted', {'history': self.history})
+        safe = self.context.redactor.value(new)
+        await self._event('context_compacted', {'history': safe, 'source': source, 'reason': reason,
+                                              'kept_responses': kept_responses})
+        self.history = safe
+        self._compaction_source = source
         return True
 
     async def run_turn(self, prompt: str, cancel_event: asyncio.Event):
@@ -97,7 +158,10 @@ class AgentEngine:
                     raise asyncio.CancelledError
                 schemas = self.registry.schemas(self.context.policy.mode)
                 if self.manager.needs_compaction(self.history, schemas):
-                    await self.compact(cancel_event)
+                    changed = await self.compact(cancel_event)
+                    if changed:
+                        source = getattr(self, '_compaction_source', 'model')
+                        yield await self._event('state_changed', {'state': 'context_ready', 'source': source})
                 request = self.manager.build_request(self.history, schemas)
                 yield await self._event('state_changed', {'state': 'requesting', 'request_number': turn + 1})
                 response = None

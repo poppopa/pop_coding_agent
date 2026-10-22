@@ -15,7 +15,7 @@ FIXTURE = Path(__file__).resolve().parents[1] / "cli_process_fixture.py"
 
 def environment():
     # 只透传运行测试所需变量；不读取或转储任何凭证。
-    return {"PATH": os.defpath, "PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1", "OPENBLAS_NUM_THREADS": "1", "OMP_NUM_THREADS": "1", "TERM": "xterm-256color", "PYTHONUNBUFFERED": "1"}
+    return {"PATH": os.defpath, "PYTHONPATH": str(Path(__file__).resolve().parents[2] / "src"), "PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1", "OPENBLAS_NUM_THREADS": "1", "OMP_NUM_THREADS": "1", "TERM": "xterm-256color", "PYTHONUNBUFFERED": "1"}
 
 
 def prepare(tmp_path):

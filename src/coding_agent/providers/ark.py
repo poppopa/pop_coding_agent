@@ -160,6 +160,16 @@ class ArkProvider:
         calls: list[ToolCall] = []
         seen_ids: set[str] = set()
         diagnostic = ''
+        if status == 'incomplete':
+            reason = _field(_field(response, 'incomplete_details'), 'reason')
+            if reason == 'max_output_tokens':
+                diagnostic = 'PROVIDER_OUTPUT_LIMIT: 模型输出预算已耗尽，响应未完成'
+            elif reason == 'content_filter':
+                diagnostic = 'PROVIDER_CONTENT_FILTER: 模型响应被内容过滤中止'
+            else:
+                diagnostic = 'PROVIDER_PROTOCOL_ERROR: 模型响应未完成'
+        elif status == 'failed':
+            diagnostic = 'PROVIDER_UNAVAILABLE: 模型返回失败终态'
         if status == 'completed':
             for item in raw_output:
                 if item.get('type') != 'function_call':
@@ -288,9 +298,12 @@ class ArkProvider:
 
             async def open_stream() -> Any:
                 nonlocal sdk_stream
+                # 摘要不开放工具。省去空tools参数，避免模型对空数组
+                # 的不同处理；正常工具请求仍完整传入定义。
+                options = {'tools': deepcopy(list(request.tool_schemas))} if request.tool_schemas else {}
                 sdk_stream = await self._client.responses.create(
                     model=self.model, instructions=request.instructions,
-                    input=deepcopy(inputs), tools=deepcopy(list(request.tool_schemas)),
+                    input=deepcopy(inputs), **options,
                     max_output_tokens=request.max_output_tokens,
                     store=False, stream=True,
                 )
@@ -341,7 +354,7 @@ class ArkProvider:
                 )
             except Exception as exc:
                 # SDK 重试为 0；一旦收到任何事件便不重试，避免重复展示增量。
-                if not received_event and attempt < _MAX_RETRIES and self._retryable(exc):
+                if request.retry_on_connection_error and not received_event and attempt < _MAX_RETRIES and self._retryable(exc):
                     retry_delay = self._retry_delay(exc, attempt)
                 else:
                     terminal = ModelFrame(

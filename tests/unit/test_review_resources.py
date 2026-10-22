@@ -112,7 +112,7 @@ async def test_approval_prompt_does_not_replace_outer_sigint_handler(tmp_path, m
             return "n"
 
     monkeypatch.setattr(terminal, "PromptSession", Prompt)
-    monkeypatch.setattr(terminal, "patch_stdout", nullcontext)
+    monkeypatch.setattr(terminal, "patch_stdout", lambda **kwargs: nullcontext())
     engine = engine_for_terminal(tmp_path)
 
     async def run_turn(prompt, cancel):
@@ -135,7 +135,7 @@ async def test_manual_compact_receives_sigint_and_returns_to_input(tmp_path, mon
             return next(prompts)
 
     monkeypatch.setattr(terminal, "PromptSession", Prompt)
-    monkeypatch.setattr(terminal, "patch_stdout", nullcontext)
+    monkeypatch.setattr(terminal, "patch_stdout", lambda **kwargs: nullcontext())
     engine = engine_for_terminal(tmp_path)
     observed = []
     loop = asyncio.get_running_loop()

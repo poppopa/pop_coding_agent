@@ -59,7 +59,7 @@ async def test_four_files_in_one_response_finish_with_default_tools_and_original
                 return next(prompts)
 
         monkeypatch.setattr(terminal, "PromptSession", Prompt)
-        monkeypatch.setattr(terminal, "patch_stdout", nullcontext)
+        monkeypatch.setattr(terminal, "patch_stdout", lambda **kwargs: nullcontext())
     args = cli.parser().parse_args(["--root", str(root)] + (["exec", prompt, "--json"] if entry == "exec" else []))
     provider = FakeProvider()
     config = AgentConfig(model="test-model", state_dir=state)

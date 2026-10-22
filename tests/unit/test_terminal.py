@@ -32,7 +32,7 @@ async def test_keyboard_bindings_submit_newline_clear_and_empty_eof(tmp_path, mo
             raise EOFError
 
     monkeypatch.setattr(terminal, "PromptSession", Prompt)
-    monkeypatch.setattr(terminal, "patch_stdout", nullcontext)
+    monkeypatch.setattr(terminal, "patch_stdout", lambda **kwargs: nullcontext())
     assert await terminal.interactive(fake_engine(tmp_path), SimpleNamespace(), Console(file=StringIO())) == 0
     assert captured["multiline"] is True
     bindings = captured["key_bindings"]
@@ -62,7 +62,7 @@ async def test_slash_commands_are_local_and_mode_changes_policy(tmp_path, monkey
             return next(prompts)
 
     monkeypatch.setattr(terminal, "PromptSession", Prompt)
-    monkeypatch.setattr(terminal, "patch_stdout", nullcontext)
+    monkeypatch.setattr(terminal, "patch_stdout", lambda **kwargs: nullcontext())
     engine = fake_engine(tmp_path)
     engine.run_turn = Mock(side_effect=AssertionError("斜杠命令不发送模型"))
     output = StringIO()
@@ -125,7 +125,7 @@ async def test_context_and_noop_compact_show_input_budget_without_model_request(
     engine = AgentEngine(Provider(), [], Store(), file_context, config)
     engine.history = [{"kind": "message", "role": "user", "content": "当前目标原文"}]
     monkeypatch.setattr(terminal, "PromptSession", Prompt)
-    monkeypatch.setattr(terminal, "patch_stdout", nullcontext)
+    monkeypatch.setattr(terminal, "patch_stdout", lambda **kwargs: nullcontext())
     output = StringIO()
     assert await terminal.interactive(engine, config, Console(file=output, width=160)) == 0
     text = output.getvalue()
@@ -170,7 +170,7 @@ async def test_successful_manual_compact_reports_completed_and_preserves_current
     goal = {"kind": "message", "role": "user", "content": "当前目标原文"}
     engine.history = [goal, *[{"kind": "response", "items": []} for _ in range(3)]]
     monkeypatch.setattr(terminal, "PromptSession", Prompt)
-    monkeypatch.setattr(terminal, "patch_stdout", nullcontext)
+    monkeypatch.setattr(terminal, "patch_stdout", lambda **kwargs: nullcontext())
     output = StringIO()
     assert await terminal.interactive(engine, config, Console(file=output, width=160)) == 0
     assert "历史已整理" in output.getvalue() and "无需整理" not in output.getvalue()

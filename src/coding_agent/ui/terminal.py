@@ -49,7 +49,7 @@ async def interactive(engine, config, console=None):
         console.print('命令：' + shlex.join(argv), markup=False)
         console.print('目录：' + str(cwd), markup=False)
         try:
-            with patch_stdout():
+            with patch_stdout(raw=True):
                 answer = await PromptSession().prompt_async('允许一次 [y] / 本会话相同命令 [s] / 拒绝 [n]：', handle_sigint=False)
         except (EOFError, KeyboardInterrupt):
             return 'deny'
@@ -57,7 +57,7 @@ async def interactive(engine, config, console=None):
     engine.approval = approval
     while True:
         try:
-            with patch_stdout():
+            with patch_stdout(raw=True):
                 prompt = await session.prompt_async(f'{engine.context.policy.mode} > ')
         except EOFError:
             return 0
@@ -91,7 +91,12 @@ async def interactive(engine, config, console=None):
                 loop.add_signal_handler(signal.SIGINT, cancel.set)
                 try:
                     changed = await engine.compact(cancel)
-                    console.print('历史已整理，完整日志保留。' if changed else '当前没有可整理的旧轮次，无需整理。')
+                    if changed:
+                        local = getattr(engine, '_compaction_source', 'model') == 'local'
+                        console.print('模型摘要不可用，已按本地执行事实整理，完整日志保留。' if local
+                                      else '历史已整理，完整日志保留。')
+                    else:
+                        console.print('当前没有可整理的旧轮次，无需整理。')
                 except asyncio.CancelledError:
                     console.print('历史整理已取消，保留原历史。')
                 except Exception as exc:
@@ -107,7 +112,9 @@ async def interactive(engine, config, console=None):
         previous = signal.getsignal(signal.SIGINT)
         loop.add_signal_handler(signal.SIGINT, cancel.set)
         try:
-            with patch_stdout():
+            # Rich已经生成ANSI样式，代理必须原样转发；非raw输出会
+            # 把ESC替换成问号，形成用户看到的?[36m颜色乱码。
+            with patch_stdout(raw=True):
                 async for event in engine.run_turn(prompt, cancel):
                     renderer.handle(event)
         finally:
